@@ -23,5 +23,13 @@ export const api = {
     req(sessionId ? `/api/session-proofs?session_id=${encodeURIComponent(sessionId)}` : '/api/session-proofs'),
   gapBoundaries: (sessionId) =>
     req(sessionId ? `/api/gap-boundaries?session_id=${encodeURIComponent(sessionId)}` : '/api/gap-boundaries'),
+  gapWatermark: (visitorId) =>
+    req(visitorId ? `/api/gap-watermark?visitor_id=${encodeURIComponent(visitorId)}` : '/api/gap-watermark'),
+  gapWatermarkCertificates: (visitorId) =>
+    req(
+      visitorId
+        ? `/api/gap-watermark-certificates?visitor_id=${encodeURIComponent(visitorId)}`
+        : '/api/gap-watermark-certificates',
+    ),
   settings: () => req('/api/settings'),
 }

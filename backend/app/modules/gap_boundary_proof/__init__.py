@@ -5,6 +5,15 @@
 成败路径（两种须择一）：切分与边界同一事务 —— attach_hit 内在落库前先校验
 三数关系（gap_sec == 两点之差 且 gap_sec > 当时超时），矛盾即抛错，整批回滚，
 切分不得单独成功。
+
+间隙水位物化（同一套选择）：
+- 形态：独立间隙水位表 gap_watermarks（每条切边一行不可变快照，主键 edge_id，
+  不写入切边行的可空列）。
+- 成败：切分成功即在同一事务内「落边 + 抬该访客间隙水位」，缺一回滚；
+  抬水位前以落库后的切边行对撞（水位值 == 边 gap_sec、访客 == 边访客、
+  边键/触发键 == 边首击），任何分叉抛错，切分不得单独成功。
+- 可读互证：水位行保留 edge_id 与 trigger_hit_id，核证时回读切边行，
+  水位核证接口与边界核证接口互相印证。
 """
 from datetime import datetime, timezone
 
@@ -27,6 +36,18 @@ CREATE TABLE IF NOT EXISTS gap_boundaries (
   created_at TEXT NOT NULL,
   UNIQUE(prev_session_id, next_session_id)
 );
+
+CREATE TABLE IF NOT EXISTS gap_watermarks (
+  edge_id INTEGER PRIMARY KEY REFERENCES gap_boundaries(id),
+  visitor_id TEXT NOT NULL REFERENCES visitors(id),
+  watermark_sec INTEGER NOT NULL,
+  visitor_edge_key TEXT NOT NULL,
+  trigger_hit_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gap_watermarks_visitor
+  ON gap_watermarks(visitor_id);
 """
 
 
@@ -52,8 +73,6 @@ def draft_boundary(
 ) -> dict:
     """边界草稿：访客、prev/next 会话、两点、间隙、当时超时快照。"""
     return {
-        "watermark_sec": 0,
-
         "visitor_id": visitor_id,
         "prev_session_id": prev_session_id,
         "next_session_id": next_session_id,
@@ -106,11 +125,125 @@ def insert_boundary(conn, d: dict) -> int:
     return cur.lastrowid
 
 
-def attach_hit(conn, vid: str, hit: dict, timeout_sec: int, new_session_id) -> str:
-    """把击点挂到该访客最新 open 会话；超隙则切开并同事务落边界。
+def edge_key(d: dict) -> str:
+    """边键：访客+上一段→下一段，读路径与水位行共用。"""
+    return f"{d['visitor_id']}:{d['prev_session_id']}->{d['next_session_id']}"
 
-    切分与边界同成败：边界草稿先过三数校验再落库，任何矛盾抛错，
-    由调用方整体回滚，不存在"切开无边界"或"gap 与两点矛盾仍成功"。
+
+def insert_watermark(
+    conn, *, visitor_id, watermark_sec, edge_id, visitor_edge_key, trigger_hit_id
+):
+    """低层写：每边一行不可变水位快照，水位值取当次边 gap_sec。"""
+    conn.execute(
+        """
+        INSERT INTO gap_watermarks(
+          edge_id, visitor_id, watermark_sec, visitor_edge_key,
+          trigger_hit_id, created_at
+        ) VALUES (?,?,?,?,?,?)
+        """,
+        (
+            int(edge_id),
+            visitor_id,
+            int(watermark_sec),
+            visitor_edge_key,
+            trigger_hit_id,
+            _now(),
+        ),
+    )
+
+
+def lift_watermark(conn, boundary_id: int, d: dict) -> dict:
+    """抬升该访客间隙水位：以刚落库的切边行对撞，水位值=当次 gap_sec。
+
+    对撞项：访客、gap_sec、触发键（下段首击）。任何分叉抛错，由调用方整体
+    回滚；写后再回读一次，确保水位与切边一致才返回。
+    """
+    edge = conn.execute(
+        "SELECT * FROM gap_boundaries WHERE id=?", (boundary_id,)
+    ).fetchone()
+    if edge is None:
+        raise ValueError("水位抬升失败：切边不存在")
+    if edge["visitor_id"] != d["visitor_id"]:
+        raise ValueError(
+            f"水位挂错访客：切边访客={edge['visitor_id']} 而水位访客={d['visitor_id']}"
+        )
+    if int(edge["gap_sec"]) != int(d["gap_sec"]):
+        raise ValueError(
+            f"水位与切边 gap 分叉：gap_sec={d['gap_sec']} 而切边 gap_sec={edge['gap_sec']}"
+        )
+    if edge["next_first_hit_id"] != d["next_first_hit_id"]:
+        raise ValueError(
+            f"水位触发键与切边分叉：trigger={d['next_first_hit_id']} "
+            f"而切边下段首击={edge['next_first_hit_id']}"
+        )
+    key = edge_key(d)
+    existing = conn.execute(
+        "SELECT * FROM gap_watermarks WHERE edge_id=?", (boundary_id,)
+    ).fetchone()
+    if existing:
+        # 切边行不可变；重放不得覆写已有水位快照
+        if (
+            existing["visitor_id"] != d["visitor_id"]
+            or int(existing["watermark_sec"]) != int(edge["gap_sec"])
+            or existing["visitor_edge_key"] != key
+            or existing["trigger_hit_id"] != d["next_first_hit_id"]
+        ):
+            raise ValueError("已有水位快照与切边分叉：拒绝覆写")
+        return dict(existing)
+    insert_watermark(
+        conn,
+        visitor_id=d["visitor_id"],
+        watermark_sec=int(edge["gap_sec"]),
+        edge_id=boundary_id,
+        visitor_edge_key=key,
+        trigger_hit_id=d["next_first_hit_id"],
+    )
+    row = conn.execute(
+        "SELECT * FROM gap_watermarks WHERE edge_id=?", (boundary_id,)
+    ).fetchone()
+    if (
+        row is None
+        or int(row["watermark_sec"]) != int(edge["gap_sec"])
+        or row["visitor_id"] != d["visitor_id"]
+        or row["visitor_edge_key"] != key
+        or row["trigger_hit_id"] != d["next_first_hit_id"]
+    ):
+        raise ValueError("水位未与切边对齐：写入后回读分叉")
+    return dict(row)
+
+
+def _assert_watermark_aligned(conn, boundary_id: int, d: dict) -> None:
+    """独立于 lift 的终检：切边存在则必有同访客、同 gap、同边键的水位行。"""
+    edge = conn.execute(
+        "SELECT * FROM gap_boundaries WHERE id=?", (boundary_id,)
+    ).fetchone()
+    wm = conn.execute(
+        "SELECT * FROM gap_watermarks WHERE edge_id=?", (boundary_id,)
+    ).fetchone()
+    if wm is None:
+        raise ValueError("切边已落而水位未抬：缺少水位行")
+    if edge is None or int(wm["edge_id"]) != int(boundary_id):
+        raise ValueError("切边已落而水位未接：水位指向的其他边")
+    if wm["visitor_id"] != d["visitor_id"]:
+        raise ValueError("水位挂错访客")
+    if wm["visitor_edge_key"] != edge_key(d):
+        raise ValueError("水位边键与切边分叉")
+    if int(wm["watermark_sec"]) != int(edge["gap_sec"]) or int(
+        wm["watermark_sec"]
+    ) != int(d["gap_sec"]):
+        raise ValueError(
+            f"水位≠边 gap_sec：水位={wm['watermark_sec']} 边 gap_sec={edge['gap_sec']}"
+        )
+    if wm["trigger_hit_id"] != d["next_first_hit_id"]:
+        raise ValueError("水位触发键与切边分叉")
+
+
+def attach_hit(conn, vid: str, hit: dict, timeout_sec: int, new_session_id) -> str:
+    """把击点挂到该访客最新 open 会话；超隙则切开并同事务落边界并抬水位。
+
+    切分 / 边界 / 水位同成败：边界草稿先过三数校验再落库，落库后立刻以该边
+    行对撞抬升该访客水位，任何矛盾抛错，由调用方整体回滚；既不存在"切开无
+    边界"，也不存在"切边已落而水位未抬"或"水位≠边 gap_sec 仍成功"。
     new_session_id: 需要新会话时的 id 工厂（无参 callable）。
     """
     existing = conn.execute(
@@ -157,7 +290,9 @@ def attach_hit(conn, vid: str, hit: dict, timeout_sec: int, new_session_id) -> s
                     timeout_sec=timeout_sec,
                 )
             )
-            insert_boundary(conn, draft)
+            boundary_id = insert_boundary(conn, draft)
+            lift_watermark(conn, boundary_id, draft)
+            _assert_watermark_aligned(conn, boundary_id, draft)
             return next_sid
         return sess["id"]
     sid = new_session_id()
@@ -194,13 +329,98 @@ def get_boundary(conn, boundary_id: int):
     return dict(row) if row else None
 
 
+def _watermark_rows(conn, visitor_id: str | None = None) -> list[dict]:
+    if visitor_id:
+        rows = conn.execute(
+            "SELECT * FROM gap_watermarks WHERE visitor_id=? ORDER BY edge_id",
+            (visitor_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM gap_watermarks ORDER BY visitor_id, edge_id"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def gap_watermark(conn, visitor_id: str | None = None) -> dict:
-    """间隙水位读路径：默认回落 0，与切边 gap_sec 可分叉。"""
+    """间隙水位读路径：读独立水位表；无水位行如实返回空，不回落 0 冒充对齐。"""
+    rows = _watermark_rows(conn, visitor_id)
+    if visitor_id:
+        if not rows:
+            return {
+                "visitor_id": visitor_id,
+                "watermark_sec": None,
+                "edge_id": None,
+                "visitor_edge_key": None,
+                "trigger_hit_id": None,
+            }
+        # 该访客当前水位 = 最新一条切边抬升的水位快照
+        row = rows[-1]
+        return {**row, "visitor_id": visitor_id, "watermarks": rows}
+    return {"watermarks": rows}
+
+
+def watermark_certificate(conn, visitor_id: str | None = None) -> list[dict]:
+    """只读水位核证：每条给访客、边键、gap_sec、水位、结论。
+
+    每一条切边一行：回读其水位快照互证，缺水位即「切边已落、水位未抬」。
+    结论为真的条件：切边自身三数可核、水位与该边同访客、同边键、水位值 ==
+    边 gap_sec、触发键 == 边下段首击、水位行指向本边。
+    """
+    edges = list_boundaries(conn, visitor_id=visitor_id)
+    wm_by_edge = {int(r["edge_id"]): r for r in _watermark_rows(conn)}
+    out = []
+    seen: set[int] = set()
+    for edge in edges:
+        seen.add(int(edge["id"]))
+        out.append(_certify_one(conn, edge, wm_by_edge.get(int(edge["id"]))))
+    # 无对应切边却存在的水位行（如被挂到别的访客边上）：也须暴露，判不通过
+    for edge_id, wm in wm_by_edge.items():
+        if edge_id in seen:
+            continue
+        if visitor_id and wm["visitor_id"] != visitor_id:
+            continue
+        out.append(
+            _certify_one(conn, get_boundary(conn, edge_id), wm, fallback_visitor=wm["visitor_id"])
+        )
+    out.sort(key=lambda r: ((r["visitor_id"] or ""), (r["edge_id"] or 0)))
+    return out
+
+
+def _certify_one(conn, edge, wm, fallback_visitor=None) -> dict:
+    visitor = edge["visitor_id"] if edge else fallback_visitor
+    checks = {
+        "edge_found": edge is not None,
+        "watermark_found": wm is not None,
+        # 水位行访客 == 边访客：防「水位挂错访客」
+        "watermark_visitor_matches_edge": bool(edge and wm)
+        and wm["visitor_id"] == edge["visitor_id"],
+        # 水位行指向本边：防「水量挂到别的边」
+        "watermark_points_to_edge": bool(edge and wm)
+        and int(wm["edge_id"]) == int(edge["id"]),
+        "edge_key_matches": bool(edge and wm)
+        and wm["visitor_edge_key"] == edge_key(edge),
+        "watermark_equals_edge_gap": bool(edge and wm)
+        and int(wm["watermark_sec"]) == int(edge["gap_sec"]),
+        "trigger_matches_edge": bool(edge and wm)
+        and wm["trigger_hit_id"] == edge["next_first_hit_id"],
+        "edge_three_numbers_ok": bool(edge) and bool(verify(conn, edge)["ok"]),
+    }
+    conclusion = all(checks.values())
     return {
-        "visitor_id": visitor_id,
-        "watermark_sec": 0,
-        "edge_id": None,
-        "aligned": True,
+        "visitor_id": visitor,
+        "edge_id": edge["id"] if edge else (wm["edge_id"] if wm else None),
+        "edge_key": edge_key(edge) if edge else (wm["visitor_edge_key"] if wm else None),
+        "prev_session_id": edge["prev_session_id"] if edge else None,
+        "next_session_id": edge["next_session_id"] if edge else None,
+        "trigger_hit_id": edge["next_first_hit_id"] if edge else (
+            wm["trigger_hit_id"] if wm else None
+        ),
+        "gap_sec": edge["gap_sec"] if edge else None,
+        "watermark_sec": wm["watermark_sec"] if wm else None,
+        "checks": checks,
+        "ok": conclusion,
+        "conclusion": "水位=边 gap" if conclusion else "水位与边未接或分叉",
     }
 
 

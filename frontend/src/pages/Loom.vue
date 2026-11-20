@@ -6,10 +6,15 @@ const overview = ref(null)
 const sessions = ref([])
 const details = ref({})
 const boundaries = ref([])
+const watermarks = ref([])
 const err = ref('')
 
 function gapOf(sessionId) {
   return boundaries.value.find((b) => b.next_session_id === sessionId)
+}
+
+function watermarkOfEdge(boundary) {
+  return watermarks.value.find((w) => w.edge_id === boundary.id) || null
 }
 
 async function load() {
@@ -18,6 +23,8 @@ async function load() {
     overview.value = await api.overview()
     sessions.value = await api.sessions()
     boundaries.value = await api.gapBoundaries()
+    const cert = await api.gapWatermarkCertificates()
+    watermarks.value = cert.rows || []
     const map = {}
     for (const s of sessions.value) {
       map[s.id] = await api.session(s.id)
@@ -41,6 +48,7 @@ onMounted(load)
       <div class="stat"><b>{{ overview.hits_primary }}</b><span>正式击点</span></div>
       <div class="stat"><b>{{ overview.quarantine }}</b><span>隔离</span></div>
       <div class="stat"><b>{{ overview.gap_boundaries }}</b><span>切分边界</span></div>
+      <div class="stat"><b>{{ overview.gap_watermarks }}</b><span>间隙水位</span></div>
       <div class="stat"><b>{{ overview.idle_timeout_sec }}s</b><span>空闲超时</span></div>
     </div>
     <p v-if="err" class="err">{{ err }}</p>
@@ -65,6 +73,11 @@ onMounted(load)
             · 间隙 <b class="mono">{{ gapOf(s.id).gap_sec }}s</b> ＞ 当时超时
             <b class="mono">{{ gapOf(s.id).timeout_sec_snapshot }}s</b>
             · 边界 <span class="mono">#{{ gapOf(s.id).id }}</span>
+            · 水位
+            <b
+              class="mono"
+              :class="watermarkOfEdge(gapOf(s.id))?.ok ? 'ok' : 'err'"
+            >{{ watermarkOfEdge(gapOf(s.id))?.watermark_sec ?? '未抬' }}s</b>
           </div>
           <div class="beads" v-if="details[s.id]">
             <template v-for="(h, i) in details[s.id].hits" :key="h.id">

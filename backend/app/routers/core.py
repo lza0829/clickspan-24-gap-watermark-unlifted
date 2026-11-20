@@ -23,6 +23,9 @@ def overview():
             "gap_boundaries": conn.execute(
                 "SELECT COUNT(*) AS c FROM gap_boundaries"
             ).fetchone()["c"],
+            "gap_watermarks": conn.execute(
+                "SELECT COUNT(*) AS c FROM gap_watermarks"
+            ).fetchone()["c"],
             "idle_timeout_sec": idle_timeout_sec(conn),
         }
     finally:
@@ -154,6 +157,17 @@ def get_gap_watermark(visitor_id: str | None = None):
     conn = connect()
     try:
         return gap_watermark(conn, visitor_id)
+    finally:
+        conn.close()
+
+
+@router.get("/gap-watermark-certificates")
+def gap_watermark_certificates(visitor_id: str | None = None):
+    """间隙水位核证只读接口：访客、边键、gap_sec、水位、结论，与切边互证。"""
+    conn = connect()
+    try:
+        rows = gap_boundary_proof.watermark_certificate(conn, visitor_id)
+        return {"rows": rows, "ok": all(r["ok"] for r in rows)}
     finally:
         conn.close()
 
